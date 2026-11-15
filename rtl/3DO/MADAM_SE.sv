@@ -1219,7 +1219,7 @@ module MADAM_SE
 	bit  [11: 0] Y_A,Y_B,REGIS_A_Y,REGIS_B_Y;
 	bit          CLIPX_A,CLIPY_A,CLIPX_B,CLIPY_B;
 	
-	wire         REGIS_A_START,REGIS_A_TERMINATE;
+	bit          REGIS_A_START,REGIS_A_TERMINATE;
 	always_comb begin		
 		Y_A = REGIS_A_OUT ? REGIS_A_Y : MATH_A_Y;
 				
@@ -1249,7 +1249,7 @@ module MADAM_SE
 		.DONE(REGIS_A_DONE)
 	);
 	
-	wire         REGIS_B_START,REGIS_B_TERMINATE;
+	bit          REGIS_B_START,REGIS_B_TERMINATE;
 	always_comb begin		
 		Y_B = REGIS_B_OUT ? REGIS_B_Y : MATH_B_Y;
 				
