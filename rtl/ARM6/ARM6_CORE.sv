@@ -160,6 +160,14 @@ module ARM6_CORE
 	
 	wire [ 4: 0] STATE_NEXT = !DECI.NST ? STATE : !DECI.LST ? STATE + 5'd1 : 5'd0;
 	bit RESET_PEND,FIQ_PEND,IRQ_PEND;
+	// Game Bub port: the executing instruction takes the undefined instruction
+	// trap. It is put in EX_IC as an SWI with its condition (Decode runs that);
+	// mode, SPSR and vector are chosen here. Substituted when EX_IC is loaded, so
+	// that UndefTrap is not in front of the decode (the CPU decode to nMREQ to
+	// MADAM to SDRAM controller path is the design's critical path).
+	bit UND_TRAP;
+	// Game Bub port: a word load whose data is rotated by the address (LDR, SWP)
+	wire WORD_ROT = (EX_IC[27:26] == 2'b01) || (EX_IC[27:23] == 5'b00010 && EX_IC[7:4] == 4'b1001);
 	always @(posedge CLK or negedge RST_N) begin
 		if (!RST_N) begin
 			STATE <= '0;
@@ -167,25 +175,32 @@ module ARM6_CORE
 			RESET_PEND <= 1;
 			FIQ_PEND <= 0;
 			IRQ_PEND <= 0;
+			UND_TRAP <= 0;
 		end
 		else if (RES_SYNC) begin
 			STATE <= '0;
 			EX_IC <= 32'hEF000000;
 			RESET_PEND <= 1;
+			FIQ_PEND <= 0;//Game Bub port: a reset abandons an exception entry in progress
+			IRQ_PEND <= 0;
+			UND_TRAP <= 0;
 		end
 		else if (EN && CE_F) begin
 			STATE <= STATE_NEXT;
 			 
 			if (DECI.NST && DECI.LST) begin
-				EX_IC <= DI_IC;
+				EX_IC <= UndefTrap(DI_IC) ? {DI_IC[31:28], 4'hF, 24'h000000} : DI_IC;
+				UND_TRAP <= UndefTrap(DI_IC);
 
 				if (FIQ && !CPSR.F) begin
 					EX_IC <= 32'hEF000000;
 					FIQ_PEND <= 1;
+					UND_TRAP <= 0;
 				end
 				else if (IRQ && !CPSR.I) begin
 					EX_IC <= 32'hEF000000;
 					IRQ_PEND <= 1;
+					UND_TRAP <= 0;
 				end
 				else begin
 					RESET_PEND <= 0;
@@ -228,7 +243,11 @@ module ARM6_CORE
 			endcase
 		
 		case (DECI.MCTL.SZ)
-			1'b0: MD = DIN;
+			// Game Bub port: a word load (LDR, SWP) from an address that is not word aligned
+			// is rotated right by 8 times A[1:0], in either endianness (ARM60 datasheet
+			// 4.7.6: the addressed byte ends up in bits 7:0 little endian, 31:24 or 15:8 big
+			// endian). LDM does not rotate.
+			1'b0: MD = WORD_ROT ? ((DIN >> {BA,3'b000}) | (DIN << (6'd32 - {1'b0,BA,3'b000}))) : DIN;
 			1'b1: case (BA^{2{BIGEND}})
 				2'b11: MD = {24'h000000,DIN[31:24]};
 				2'b10: MD = {24'h000000,DIN[23:16]};
@@ -250,10 +269,12 @@ module ARM6_CORE
 		SHIFT_A = DECI.DPCTL.SB ? IMM : RB_RBQ;
 		case (DECI.DPCTL.SHCTL)
 			SHFT_NONE:  begin SHIFT_SA = '0;                                             SHIFT_TYPE = 3'b000;            SHIFT_ZERO = 1; end
-			SHFT_CONST: begin SHIFT_SA = {2'b00,(EX_IC[11:5]==7'b00000_10),EX_IC[11:7]}; SHIFT_TYPE = {1'b1,EX_IC[6:5]}; SHIFT_ZERO = ~|EX_IC[11:7] & ~|EX_IC[6:5]; end
+			// LSR #0 and ASR #0 encode LSR #32 and ASR #32 (Game Bub port: LSR as well)
+			SHFT_CONST: begin SHIFT_SA = {2'b00,(EX_IC[11:7]==5'd0 && (EX_IC[6:5]==2'b01 || EX_IC[6:5]==2'b10)),EX_IC[11:7]}; SHIFT_TYPE = {1'b1,EX_IC[6:5]}; SHIFT_ZERO = ~|EX_IC[11:7] & ~|EX_IC[6:5]; end
 			SHFT_REG:   begin SHIFT_SA = SHIFT_LATCH;                                    SHIFT_TYPE = {1'b0,EX_IC[6:5]}; SHIFT_ZERO = ~|SHIFT_LATCH; end
 			SHFT_ROT:   begin SHIFT_SA = {3'b000,EX_IC[11:8],1'b0};                      SHIFT_TYPE = 3'b011;            SHIFT_ZERO = ~|EX_IC[11:8]; end
 			SHFT_LSL2:  begin SHIFT_SA = 8'd2;                                           SHIFT_TYPE = 3'b000;            SHIFT_ZERO = 0; end
+			default:    begin SHIFT_SA = '0;                                             SHIFT_TYPE = 3'b000;            SHIFT_ZERO = 1; end	//not used: no latches
 		endcase
 		
 		{SHIFT_C,SHIFT_RES} = Shifter(SHIFT_A, SHIFT_SA, SHIFT_TYPE, CPSR.C);
@@ -359,7 +380,12 @@ module ARM6_CORE
 	assign RB_WD = ALU_R;
 	assign RB_WE = DECI.RCTL.RWE;
 	
-	assign PC_D = AREG_NEXT;
+	// Game Bub port: R15 holds a word address (ARM60 datasheet 3.3: when R15 is
+	// read, bits [1:0] are zero). A write to R15 with bits [1:0] set (MOV PC,
+	// LDR PC, LDM {PC}) kept them, and every PC read and PC-relative address
+	// after it was off by them. The fetches still put them on A[1:0], as the
+	// address register is loaded from the ALU.
+	assign PC_D = {AREG_NEXT[31:2], 2'b00};
 	assign PC_WE = DECI.PCU;
 	
 	//PSR
@@ -386,6 +412,8 @@ module ARM6_CORE
 			
 			PSRC_INT: if (FIQ_PEND) {CPSR_NEXT.I,CPSR_NEXT.F,CPSR_NEXT.M} <= {1'b1,1'b1,5'b10001};
 						 else if (IRQ_PEND) {CPSR_NEXT.I,CPSR_NEXT.M} <= {1'b1,5'b10010};
+						 else if (RESET_PEND) {CPSR_NEXT.I,CPSR_NEXT.F,CPSR_NEXT.M} <= {1'b1,1'b1,5'b10011};//Reset: IRQ and FIQ disabled (ARM60 datasheet; Game Bub port fix)
+						 else if (UND_TRAP) {CPSR_NEXT.I,CPSR_NEXT.M} <= {1'b1,5'b11011};//Undefined instruction trap (Game Bub port)
 						 else {CPSR_NEXT.I,CPSR_NEXT.M} <= {1'b1,5'b10011};//for SWI
 			
 			PSRC_RET: 
@@ -423,6 +451,7 @@ module ARM6_CORE
 				PSRC_INT: 
 					if (FIQ_PEND) begin SPSR[1] <= CPSR; end
 					else if (IRQ_PEND) begin SPSR[2] <= CPSR; end
+					else if (UND_TRAP && !RESET_PEND) begin SPSR[5] <= CPSR; end//Undefined instruction trap (Game Bub port)
 					else SPSR[3] <= CPSR;//for Reset/SWI
 				
 				default:;
@@ -467,7 +496,7 @@ module ARM6_CORE
 				ADR_PC:  AREG <= PC_Q;
 				ADR_ALU: AREG <= ALU_R;
 				ADR_ALUI:AREG <= ALU_R + 32'd4;
-				ADR_VEC: AREG <= RESET_PEND ? 32'h00000000 : FIQ_PEND ? 32'h0000001C : IRQ_PEND ? 32'h00000018 : 32'h00000008;//for SWI
+				ADR_VEC: AREG <= RESET_PEND ? 32'h00000000 : FIQ_PEND ? 32'h0000001C : IRQ_PEND ? 32'h00000018 : UND_TRAP ? 32'h00000004 : 32'h00000008;//for SWI; Game Bub port: undefined instruction trap
 				default: AREG <= '0;
 			endcase
 			MCTL_ADR_PREV <= DECI.MCTL.ADR;
@@ -482,7 +511,11 @@ module ARM6_CORE
 	assign nMREQ = DECI.ICYC || DECI.CCYC;
 	assign SEQ = DECI.ICYC ? 1'b0 : DECI.CCYC ? 1'b1 : (DECI.MCTL.ADR == ADR_INC || (DECI.MCTL.ADR == ADR_PC && MCTL_ADR_PREV == ADR_PC));
 	assign nOPC = DECI.STALL;
-	assign nTRANS = ~(CPSR.M[3:0] == 4'b0000) || (EX_IC[27:24] == 4'b1111);
+	// Game Bub port: LDRT/STRT/LDRBT/STRBT (post-indexed, W set) make their transfer
+	// cycle (state 1, with its nRW) a User mode access in any mode (ARM60 datasheet
+	// 4.7.1); they were privileged.
+	wire TRANS_T = (EX_IC[27:26] == 2'b01) && !EX_IC[24] && EX_IC[21] && STATE == 5'd1;
+	assign nTRANS = (~(CPSR.M[3:0] == 4'b0000) || (EX_IC[27:24] == 4'b1111)) && !TRANS_T;
 	assign LOCK = DECI.LOCK;
 	
 `ifdef DEBUG
